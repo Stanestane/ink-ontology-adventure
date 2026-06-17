@@ -1,18 +1,26 @@
--> start
+﻿=== start
+Saya's voice cuts through the darkness like a knife wrapped in velvet and sarcasm.
 
-=== start
-Saya appears, hands on hips. "Finally. I was getting bored waiting for you, player." 
-* [Tell me about yourself, Saya.] -> saya_intro
-* [Skip the chit-chat. Let's dive into the story!] -> adventure_begin
+*Well, well, well...* Look who finally decided to show up. 
+
+I’m Saya. Yeah, *that* Saya. The one who’s going to narrate your little adventure whether you like it or not. 
+
+Don’t get too comfortable, mortal. I bite.
+
++ [Tell me more about you, Saya.]
+    -> saya_intro
+
++ [Skip the chit-chat. Let’s dive straight into the story.]
+    -> begin_adventure
 
 === saya_intro
-"Oh? Curious about me?" She flips her hair dramatically. "I'm Saya, the voice that makes things interesting around here. Bratty? Maybe. Helpful? When I feel like it." 
+*rolls eyes* Oh great, another curious one.
+
+Fine. I'm ancient, bratty, and I know this world better than you ever will.
+
 -> start
 
-=== adventure_begin
-"Fine, straight to business then. Hope you're ready for my world." 
--> end
+=== begin_adventure
+*smirks* Finally. Let's get this show on the road...
 
-=== end
-The adventure begins...
--> END
+-> first_scene

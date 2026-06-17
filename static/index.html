@@ -1,1 +1,302 @@
-<!DOCTYPE html><html><head><title>Saya's Adventure</title><script src="https://cdn.jsdelivr.net/npm/inkjs@2/dist/ink.js"></script><style>body{font-family:Arial;margin:40px} .choice{color:blue;cursor:pointer}</style></head><body><h1>Saya's Ontology World</h1><div id="story"></div><div id="choices"></div><script>let story = new inkjs.Story(`-> start === start Saya smirks. "Took you long enough." * [About you] -> intro * [Dive in] -> story_start === intro "I'm your sassy guide." -> start === story_start "Let's begin." -> END`); function refresh(){const s=document.getElementById('story');const c=document.getElementById('choices');c.innerHTML='';while(story.canContinue()) s.innerHTML += '<p>'+story.Continue()+'</p>';story.currentChoices.forEach((ch,i)=>{let b=document.createElement('div');b.className='choice';b.textContent=ch.text;b.onclick=()=>{story.ChooseChoiceIndex(i);fetch('/choice',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice:ch.text})}).then(r=>r.json()).then(d=>{if(d.ink) {story=new inkjs.Story(d.ink);refresh();}})};c.appendChild(b);});} refresh();</script></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Saya's Ontology Adventure</title>
+  <style>
+    :root {
+      --bg: #0f0a14;
+      --ink: #e0d0ff;
+      --panel: #1a1428;
+      --panel-hover: #2a1f3d;
+      --accent: #ff66cc;
+      --muted: #9a86b8;
+      --em: #ffb3e6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: Georgia, "Times New Roman", serif;
+      background: var(--bg);
+      color: var(--ink);
+      margin: 0;
+      padding: 40px 20px;
+      line-height: 1.7;
+    }
+    #wrap { max-width: 720px; margin: 0 auto; }
+    h2 { color: var(--accent); font-weight: normal; letter-spacing: .5px; }
+    #story p { margin: 0 0 1em; }
+    #story p.player { color: var(--muted); font-style: italic; }
+    #story em { color: var(--em); font-style: italic; }
+    #choices { margin-top: 24px; }
+    .choice {
+      display: block;
+      width: 100%;
+      text-align: left;
+      font: inherit;
+      color: var(--ink);
+      margin: 12px 0;
+      padding: 12px 18px;
+      background: var(--panel);
+      border: none;
+      border-left: 5px solid var(--accent);
+      cursor: pointer;
+      transition: background .15s ease;
+    }
+    .choice:hover:not(:disabled) { background: var(--panel-hover); }
+    .choice:disabled { opacity: .45; cursor: default; }
+    #status { color: var(--muted); font-style: italic; min-height: 1.4em; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <h2>Saya's Ontology Adventure</h2>
+    <div id="story"></div>
+    <div id="choices"></div>
+    <div id="status"></div>
+  </div>
+  <script>
+  (function () {
+    "use strict";
+    const storyEl = document.getElementById("story");
+    const choicesEl = document.getElementById("choices");
+    const statusEl = document.getElementById("status");
+    // Used only if /initial.ink can't be fetched (e.g. opened as a file).
+    const FALLBACK_INK = [
+      "=== start",
+      "Saya's voice cuts through the darkness like a knife wrapped in velvet and sarcasm.",
+      "",
+      "*Well, well, well...* Look who finally decided to show up.",
+      "",
+      "I'm Saya. Yeah, *that* Saya. The one who's going to narrate your little adventure whether you like it or not.",
+      "",
+      "Don't get too comfortable, mortal. I bite.",
+      "",
+      "+ [Tell me more about you, Saya.] -> saya_intro",
+      "+ [Skip the chit-chat. Let's dive straight into the story.] -> begin_adventure"
+    ].join("\n");
+
+    // ---- helpers --------------------------------------------------------
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    }
+
+    // Escape, then render *emphasis* / **bold** the way the model intends.
+    function formatNarrative(text) {
+      let t = escapeHtml(text);
+      t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      t = t.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+      return t;
+    }
+
+    function preClean(raw) {
+      return String(raw)
+        .replace(/\r\n/g, "\n")
+        .replace(/\ufeff/g, "")                       // BOM
+        .replace(/<think>[\s\S]*?<\/think>/gi, "")    // qwen3 reasoning leakage
+        .replace(/^```.*$/gm, "");                    // code fences
+    }
+    // Split raw Ink into knots. "__top__" holds anything before the first knot.
+    function parseKnots(raw) {
+      const lines = preClean(raw).split("\n");
+      const knots = { __top__: [] };
+      const order = ["__top__"];
+      let current = "__top__";
+      for (const line of lines) {
+        const m = line.trim().match(/^={2,}\s*([A-Za-z_]\w*)\s*=*\s*$/);
+        if (m) {
+          current = m[1];
+          if (!knots[current]) { knots[current] = []; order.push(current); }
+          continue;
+        }
+        knots[current].push(line);
+      }
+      return { order, knots };
+    }
+
+    // A real Ink choice marker (+ / * / nested) is followed by whitespace or
+    // a '[' bracket. This separates true choices from inline *emphasis* and
+    // **bold**, which begin with '*' immediately followed by a letter.
+    function isChoice(line) {
+      return /^[*+]+(?:\s|\[)/.test(line);
+    }
+
+    // Parse a single choice line into { text, target }.
+    function parseChoiceLine(line) {
+      let s = line.replace(/^[\*\+\s]+/, "");      // drop +/* markers (incl. nested)
+      s = s.replace(/^\([^)]*\)\s*/, "");          // drop (labelName)
+      let target = null;
+      const dm = s.match(/->\s*(\S+)\s*$/);
+      if (dm) { target = dm[1]; s = s.replace(/->\s*\S+\s*$/, "").trim(); }
+      const bm = s.match(/^([^\[]*)\[([^\]]*)\]/); // before[inside]after -> before+inside
+      if (bm) s = (bm[1] + bm[2]).trim();
+      s = s.replace(/<>/g, "").trim();
+      return s ? { text: s, target } : null;
+    }
+    // Mini Ink runner: follows narrative + diverts from an entry knot until it
+    // reaches a choice set, an END/DONE, or a divert to an unknown knot (which
+    // is where the LLM backend takes over). Returns visible narrative + choices.
+    function runInk(raw, entry) {
+      const { order, knots } = parseKnots(raw);
+      let knot = entry;
+      if (!knot || !knots[knot]) {
+        knot = knots["start"] ? "start"
+             : (order.find(n => (knots[n] || []).some(l => l.trim())) || "__top__");
+      }
+
+      const seen = new Set();
+      const paragraphs = [];
+      let buffer = [];
+      let choices = null;
+      const flush = () => {
+        if (buffer.length) { paragraphs.push(buffer.join(" ").trim()); buffer = []; }
+      };
+
+      while (knot && !choices) {
+        if (seen.has(knot)) break;            // loop guard
+        seen.add(knot);
+        const body = knots[knot] || [];
+        let diverted = null;
+
+        for (let i = 0; i < body.length; i++) {
+          let line = body[i].trim();
+          if (!line) { flush(); continue; }
+          line = line.replace(/\/\/.*$/, "").trim();
+          if (!line || line[0] === "#") continue;
+          if (/^(VAR|CONST|LIST|INCLUDE|EXTERNAL)\b/.test(line)) continue;
+
+          const dm = line.match(/^->\s*(\S+)\s*$/);
+          if (dm) { diverted = dm[1]; break; }
+          // a choice block: gather consecutive choices + their (possibly
+          // next-line, indented) diverts.
+          if (isChoice(line)) {
+            const ch = [];
+            for (; i < body.length; i++) {
+              const cl = body[i].trim();
+              if (!cl) continue;
+              if (isChoice(cl)) {
+                const parsed = parseChoiceLine(cl);
+                if (parsed) ch.push(parsed);
+                continue;
+              }
+              const d2 = cl.match(/^->\s*(\S+)\s*$/);
+              if (d2 && ch.length) {
+                if (ch[ch.length - 1].target == null) ch[ch.length - 1].target = d2[1];
+                continue;
+              }
+              i--; break;                     // narrative after choices -> stop block
+            }
+            choices = ch;
+            break;
+          }
+
+          if (/^-(?!>)/.test(line)) line = line.replace(/^-+\s*/, "");  // gather marker
+          line = line.replace(/->\s*\S+\s*$/, "").replace(/<>/g, "").trim();
+          if (line) buffer.push(line);
+        }
+        flush();
+        if (choices) break;
+
+        if (diverted) {
+          if (/^(END|DONE)$/i.test(diverted)) knot = null;
+          else if (knots[diverted]) knot = diverted;
+          else knot = null;                   // unknown target -> hand to engine
+        } else {
+          knot = null;
+        }
+      }
+      return { paragraphs: paragraphs.filter(Boolean), choices: choices || [], knots };
+    }
+    // ---- view -----------------------------------------------------------
+    function addNarrative(paragraphs, cls) {
+      for (const p of paragraphs) {
+        if (!p) continue;
+        const el = document.createElement("p");
+        if (cls) el.className = cls;
+        el.innerHTML = formatNarrative(p);
+        storyEl.appendChild(el);
+      }
+      window.scrollTo(0, document.body.scrollHeight);
+    }
+
+    function lockChoices() {
+      choicesEl.querySelectorAll("button").forEach(b => { b.disabled = true; });
+    }
+
+    function showChoices(choices) {
+      choicesEl.innerHTML = "";
+      const list = (choices && choices.length) ? choices : [{ text: "Continue", target: null }];
+      for (const c of list) {
+        const choice = (typeof c === "string") ? { text: c, target: null } : c;
+        const btn = document.createElement("button");
+        btn.className = "choice";
+        btn.textContent = choice.text;
+        btn.addEventListener("click", () => choose(choice));
+        choicesEl.appendChild(btn);
+      }
+    }
+
+    // ---- controller -----------------------------------------------------
+    let localInk = FALLBACK_INK;
+    let localKnots = {};
+    let handedOff = false;     // once true, every choice is engine-driven
+    async function choose(choice) {
+      statusEl.textContent = "";
+      addNarrative(["\u2192 " + choice.text], "player");
+      lockChoices();
+      // Every choice is answered by the ontology-grounded engine, including
+      // the opening ones (no canned local branches).
+      await askEngine(choice.text);
+    }
+
+    async function askEngine(choiceText) {
+      handedOff = true;
+      statusEl.textContent = "Saya is thinking\u2026";
+      try {
+        const res = await fetch("/choice", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ choice_text: choiceText })
+        });
+        const data = await res.json();
+        statusEl.textContent = "";
+        if (data && data.success && data.new_ink) {
+          const result = runInk(data.new_ink, null);
+          addNarrative(result.paragraphs.length ? result.paragraphs
+                                                 : ["(Saya went quiet — the engine returned no readable text.)"]);
+          showChoices(result.choices);
+        } else {
+          addNarrative(["Saya smirks but says nothing useful. (no content returned)"]);
+          showChoices([]);
+        }
+      } catch (err) {
+        statusEl.textContent = "";
+        addNarrative(["The engine is unreachable — is the server running? (" +
+                      escapeHtml(err && err.message ? err.message : err) + ")"]);
+        showChoices([]);
+      }
+    }
+    // ---- boot -----------------------------------------------------------
+    async function boot() {
+      // Begin each page load from a clean backend story.
+      try { await fetch("/reset", { method: "POST" }); } catch (e) {}
+
+      try {
+        const res = await fetch("/initial.ink");
+        if (res.ok) {
+          const text = await res.text();
+          if (text && text.trim()) localInk = text;
+        }
+      } catch (e) { /* file:// or offline -> use fallback seed */ }
+
+      const result = runInk(localInk, null);   // auto-entry -> "start"
+      localKnots = result.knots;
+      addNarrative(result.paragraphs);
+      showChoices(result.choices);
+    }
+
+    boot();
+  })();
+  </script>
+</body>
+</html>

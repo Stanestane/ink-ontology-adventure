@@ -46,14 +46,23 @@
     .choice:hover:not(:disabled) { background: var(--panel-hover); }
     .choice:disabled { opacity: .45; cursor: default; }
     #status { color: var(--muted); font-style: italic; min-height: 1.4em; margin-top: 16px; }
+    #act { color: var(--muted); font-size: .8em; letter-spacing: .08em; text-transform: uppercase; margin: -8px 0 24px; min-height: 1em; }
+    #act .bar { display: inline-block; width: 110px; height: 4px; background: var(--panel); border-radius: 2px; vertical-align: middle; margin-left: 10px; overflow: hidden; }
+    #act .bar > i { display: block; height: 100%; background: var(--accent); transition: width .4s ease; }
+    #controls { margin-top: 28px; }
+    #endbanner { color: var(--accent); font-size: 1.15em; margin: 28px 0 8px; letter-spacing: .12em; }
+    .ghost-btn { font: inherit; color: var(--muted); background: none; border: 1px solid var(--panel-hover); padding: 8px 14px; cursor: pointer; border-radius: 4px; }
+    .ghost-btn:hover { color: var(--ink); border-color: var(--accent); }
   </style>
 </head>
 <body>
   <div id="wrap">
     <h2>Saya's Ontology Adventure</h2>
+    <div id="act"></div>
     <div id="story"></div>
     <div id="choices"></div>
     <div id="status"></div>
+    <div id="controls"></div>
   </div>
   <script>
   (function () {
@@ -61,6 +70,8 @@
     const storyEl = document.getElementById("story");
     const choicesEl = document.getElementById("choices");
     const statusEl = document.getElementById("status");
+    const actEl = document.getElementById("act");
+    const controlsEl = document.getElementById("controls");
     // Used only if /initial.ink can't be fetched (e.g. opened as a file).
     const FALLBACK_INK = [
       "=== start",
@@ -236,6 +247,33 @@
       }
     }
 
+    function renderProgress(p) {
+      if (!p || !p.total) { actEl.textContent = ""; return; }
+      const pct = Math.round(((p.beat_index + 1) / p.total) * 100);
+      actEl.innerHTML = "Act " + p.act + " / " + p.total + " \u2014 " +
+        escapeHtml(p.title || "") +
+        '<span class="bar"><i style="width:' + pct + '%"></i></span>';
+    }
+
+    function showNewAdventureButton(label) {
+      controlsEl.innerHTML = "";
+      const btn = document.createElement("button");
+      btn.className = "ghost-btn";
+      btn.textContent = label || "New adventure";
+      btn.addEventListener("click", newAdventure);
+      controlsEl.appendChild(btn);
+    }
+
+    function endGame() {
+      choicesEl.innerHTML = "";
+      const end = document.createElement("div");
+      end.id = "endbanner";
+      end.textContent = "\u2014 THE END \u2014";
+      storyEl.appendChild(end);
+      showNewAdventureButton("Begin a new adventure");
+      window.scrollTo(0, document.body.scrollHeight);
+    }
+
     // ---- controller -----------------------------------------------------
     let localInk = FALLBACK_INK;
     let localKnots = {};
@@ -264,7 +302,9 @@
           const result = runInk(data.new_ink, null);
           addNarrative(result.paragraphs.length ? result.paragraphs
                                                  : ["(Saya went quiet — the engine returned no readable text.)"]);
-          showChoices(result.choices);
+          renderProgress(data.progress);
+          if (data.progress && data.progress.finished) endGame();
+          else showChoices(result.choices);
         } else {
           addNarrative(["Saya smirks but says nothing useful. (no content returned)"]);
           showChoices([]);
@@ -277,9 +317,36 @@
       }
     }
     // ---- boot -----------------------------------------------------------
+    function startScene() {
+      storyEl.innerHTML = "";
+      const result = runInk(localInk, null);   // auto-entry -> "start"
+      localKnots = result.knots;
+      addNarrative(result.paragraphs);
+      showChoices(result.choices);
+    }
+
+    async function newAdventure() {
+      statusEl.textContent = "Rolling a fresh adventure\u2026";
+      controlsEl.innerHTML = "";
+      try {
+        const res = await fetch("/new_adventure", { method: "POST" });
+        const data = await res.json();
+        renderProgress(data && data.progress);
+      } catch (e) { /* ignore */ }
+      statusEl.textContent = "";
+      startScene();
+      showNewAdventureButton();
+    }
+
     async function boot() {
-      // Begin each page load from a clean backend story.
-      try { await fetch("/reset", { method: "POST" }); } catch (e) {}
+      // Begin each page load from a clean backend story (and ensure a spine).
+      statusEl.textContent = "Spinning up the adventure\u2026";
+      try {
+        const res = await fetch("/reset", { method: "POST" });
+        const data = await res.json();
+        renderProgress(data && data.progress);
+      } catch (e) { /* file:// or offline */ }
+      statusEl.textContent = "";
 
       try {
         const res = await fetch("/initial.ink");
@@ -289,10 +356,8 @@
         }
       } catch (e) { /* file:// or offline -> use fallback seed */ }
 
-      const result = runInk(localInk, null);   // auto-entry -> "start"
-      localKnots = result.knots;
-      addNarrative(result.paragraphs);
-      showChoices(result.choices);
+      startScene();
+      showNewAdventureButton();
     }
 
     boot();

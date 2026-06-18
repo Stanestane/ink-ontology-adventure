@@ -2,75 +2,153 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-import ollama
-from ink_generator import generate_next_ink_chunk, load_ontology
+import json
+
+from ink_generator import generate_next_ink_chunk, load_ontology, generate_spine, DEFAULT_SPINE
 
 app = FastAPI(title="Saya's Ontology Adventure")
-
-# Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Load initial story
-initial_path = Path("initial.ink")
-if initial_path.exists():
-    current_story = initial_path.read_text(encoding="utf-8")
-else:
-    current_story = """=== start
-Saya's voice cuts through the darkness like a knife wrapped in velvet and sarcasm.
+SPINE_PATH = Path("data/memory/spine.json")
+MAX_BEAT_TURNS = 5          # force the story forward if a beat stalls
 
-*Well, well, well...* Look who finally decided to show up. 
+# --- Game state --------------------------------------------------------
+current_story = ""
+spine = []
+beat_index = 0
+beat_turns = 0
+finished = False
 
-I’m Saya. Yeah, *that* Saya. The one who’s going to narrate your little adventure whether you like it or not. 
 
-Don’t get too comfortable, mortal. I bite.
+def _seed_story():
+    p = Path("initial.ink")
+    if p.exists():
+        return p.read_text(encoding="utf-8")
+    return "=== start\nSaya greets you in the dark, all teeth and attitude.\n+ [Begin] -> start"
 
-+ [Tell me more about you, Saya.]
-    -> saya_intro
 
-+ [Skip the chit-chat. Let’s dive straight into the story.]
-    -> begin_adventure
+current_story = _seed_story()
 
-=== saya_intro
-*rolls eyes* Oh great, another curious one.
+def _save_spine():
+    try:
+        SPINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SPINE_PATH.write_text(json.dumps(spine, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"Could not save spine: {e}")
 
-Fine. I'm ancient, bratty, and I know this world better than you ever will.
 
--> start
+def _is_fallback(s):
+    return [b.get("title") for b in (s or [])] == [b.get("title") for b in DEFAULT_SPINE]
 
-=== begin_adventure
-*smirks* Finally. Let's get this show on the road...
 
--> first_scene
-"""
+def _ensure_spine():
+    """Use the in-memory spine, else load from disk, else generate one. A
+    persisted fallback arc is auto-upgraded once real generation succeeds."""
+    global spine
+    if spine and not _is_fallback(spine):
+        return
+    if not spine and SPINE_PATH.exists():
+        try:
+            loaded = json.loads(SPINE_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, list) and loaded:
+                spine = loaded
+        except Exception as e:
+            print(f"Could not read spine: {e}")
+    if spine and not _is_fallback(spine):
+        return
+    generated, ok = generate_spine()
+    spine = generated
+    if ok:
+        _save_spine()
+
+
+def _new_spine():
+    """Generate a fresh arc (new playthrough). Only persisted if real."""
+    global spine
+    generated, ok = generate_spine()
+    spine = generated
+    if ok:
+        _save_spine()
+
+
+def _progress():
+    total = len(spine)
+    i = max(0, min(beat_index, total - 1)) if total else 0
+    beat = spine[i] if total else {}
+    return {
+        "act": beat.get("act", i + 1) if total else 0,
+        "title": beat.get("title", "") if total else "",
+        "total": total,
+        "beat_index": i,
+        "finished": finished,
+    }
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
     with open("static/index.html", "r", encoding="utf-8") as f:
         return f.read()
 
+
 @app.post("/choice")
 async def make_choice(request: Request):
-    global current_story
+    global current_story, beat_index, beat_turns, finished
     data = await request.json()
     choice_text = data.get("choice_text", "")
 
-    next_chunk = generate_next_ink_chunk(current_story, choice_text)
-    current_story += "\n\n" + next_chunk
+    _ensure_spine()
+    if finished:
+        return {"success": True, "new_ink": "", "progress": _progress()}
 
-    return {"success": True, "new_ink": next_chunk, "full_story": current_story}
+    result = generate_next_ink_chunk(current_story, choice_text, spine, beat_index)
+    current_story += "\n\n" + result["ink"]
+
+    # Advance the spine: on the model's signal, or force it if a beat stalls.
+    beat_turns += 1
+    on_final = beat_index >= len(spine) - 1
+    if on_final:
+        if result["end"] or beat_turns >= MAX_BEAT_TURNS:
+            finished = True
+    elif result["advance"] or beat_turns >= MAX_BEAT_TURNS:
+        beat_index += 1
+        beat_turns = 0
+
+    return {"success": True, "new_ink": result["ink"], "progress": _progress()}
 
 @app.post("/reset")
 async def reset_story():
-    """Reset the running story back to the initial seed (called on page load)."""
-    global current_story
-    if Path("initial.ink").exists():
-        current_story = Path("initial.ink").read_text(encoding="utf-8")
-    return {"success": True}
+    """Reset the run to the seed and the first beat. Keeps the same arc (fast)."""
+    global current_story, beat_index, beat_turns, finished
+    current_story = _seed_story()
+    beat_index = 0
+    beat_turns = 0
+    finished = False
+    _ensure_spine()
+    return {"success": True, "progress": _progress()}
+
+
+@app.post("/new_adventure")
+async def new_adventure():
+    """Roll a fresh arc and restart (slower \u2014 regenerates the spine)."""
+    global current_story, beat_index, beat_turns, finished
+    _new_spine()
+    current_story = _seed_story()
+    beat_index = 0
+    beat_turns = 0
+    finished = False
+    return {"success": True, "progress": _progress()}
+
+
+@app.get("/spine")
+async def get_spine():
+    _ensure_spine()
+    return {"spine": spine, "progress": _progress()}
+
 
 @app.get("/initial.ink", response_class=HTMLResponse)
 async def get_initial_ink():
     with open("initial.ink", "r", encoding="utf-8") as f:
         return f.read()
+
 
 if __name__ == "__main__":
     import uvicorn
